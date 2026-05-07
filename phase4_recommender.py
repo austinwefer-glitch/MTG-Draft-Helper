@@ -56,6 +56,17 @@ BASIC_LAND_PENALTY = -45.0
 # Curve bonus for filling an underrepresented CMC bucket.
 CURVE_BONUS = 1.5
 
+# "Wheel risk" adjustment: cards with low ALSA (Average Last Seen At) get
+# sniped if passed, so we boost them to encourage taking now. Cards with
+# high ALSA tend to come back to you, so a small deprioritization saves
+# the pick for stronger contested cards.
+# These thresholds work across pack/pick numbers; tweak if needed.
+WHEEL_BONUS_VERY_CONTESTED = 2.0   # ALSA <= 2.0
+WHEEL_BONUS_CONTESTED = 1.5        # ALSA <= 3.5
+WHEEL_BONUS_MEDIUM = 0.75          # ALSA <= 5.0
+WHEEL_PENALTY_LIKELY_WHEEL = -0.75 # ALSA >= 9.0
+WHEEL_PENALTY_USUALLY_WHEELS = -1.5  # ALSA >= 11.0
+
 
 COLORS = "WUBRG"
 
@@ -205,6 +216,29 @@ def color_penalty(card_mana: str, my_colors: set, picks_made: int,
     return base_pen
 
 
+def wheel_adjustment(alsa) -> float:
+    """Adjust score by how likely the card is to wheel back to you.
+
+    ALSA = Average Last Seen At. Low values mean the card is taken
+    early (won't wheel) — boost it so we don't miss the snipe. High
+    values mean the card often comes back — small penalty so we
+    prioritize cards that won't.
+    """
+    if alsa is None:
+        return 0
+    if alsa <= 2.0:
+        return WHEEL_BONUS_VERY_CONTESTED
+    if alsa <= 3.5:
+        return WHEEL_BONUS_CONTESTED
+    if alsa <= 5.0:
+        return WHEEL_BONUS_MEDIUM
+    if alsa >= 11.0:
+        return WHEEL_PENALTY_USUALLY_WHEELS
+    if alsa >= 9.0:
+        return WHEEL_PENALTY_LIKELY_WHEEL
+    return 0
+
+
 def curve_bonus(card_cmc, picked_cards: list) -> float:
     if card_cmc is None:
         return 0
@@ -265,17 +299,19 @@ def score_card(card: dict, picked_cards: list, tier_data: dict,
     cpen = color_penalty(card.get("mana_cost", ""), my_colors,
                           len(picked_cards), gih)
     cbonus = curve_bonus(card.get("cmc"), picked_cards)
+    wheel_adj = wheel_adjustment(alsa)
     basic_pen = BASIC_LAND_PENALTY if is_basic_land(card) else 0.0
     override_adj = ((overrides or {}).get(name, {}) or {}).get("score_adjust", 0)
     override_note = ((overrides or {}).get(name, {}) or {}).get("note", "")
 
-    final = base + cpen + cbonus + basic_pen + override_adj
+    final = base + cpen + cbonus + wheel_adj + basic_pen + override_adj
     return {
         "name": name,
         "score": round(final, 1),
         "base": round(base, 1),
         "color_penalty": cpen,
         "curve_bonus": cbonus,
+        "wheel_adjust": wheel_adj,
         "basic_penalty": basic_pen,
         "override_adjust": override_adj,
         "override_note": override_note,

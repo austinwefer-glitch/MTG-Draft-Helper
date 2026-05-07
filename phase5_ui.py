@@ -554,6 +554,8 @@ class DraftHelperUI:
                 parts.append(f"color {top['color_penalty']:+g}")
             if top['curve_bonus']:
                 parts.append(f"curve +{top['curve_bonus']:g}")
+            if top.get('wheel_adjust'):
+                parts.append(f"wheel {top['wheel_adjust']:+g}")
             if top.get('basic_penalty'):
                 parts.append(f"basic-land {top['basic_penalty']:g}")
             if top.get('override_adjust'):
