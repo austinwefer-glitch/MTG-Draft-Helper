@@ -1,0 +1,73 @@
+{
+  "_README": [
+    "Color-pair archetypes for synergy scoring. Update when the set rotates.",
+    "Keys are sorted color pairs: BG, BR, BW, GR, GU, GW, RU, RW, UB, UW.",
+    "Each entry has:",
+    "  name           - human-readable archetype name (used in breakdown text)",
+    "  themes         - list of substrings searched against oracle text + keywords",
+    "  creature_types - list of subtypes that count as on-archetype",
+    "Cards matching either the creature_types OR any of the themes get a",
+    "synergy bonus when your pool's top 2 colors match this entry's key.",
+    "",
+    "Filled in for Secrets of Strixhaven (2026) based on the published",
+    "archetype guides. Each Strixhaven college has its own keyword mechanic;",
+    "the themes here are the substrings that show up in those mechanics'",
+    "rules text, plus tribal hints and theme keywords."
+  ],
+  "GU": {
+    "name": "Quandrix",
+    "themes": [
+      "+1/+1 counter",
+      "increment",
+      "noncreature spell",
+      "double",
+      "draw a card"
+    ],
+    "creature_types": ["Fractal"]
+  },
+  "BW": {
+    "name": "Silverquill",
+    "themes": [
+      "repartee",
+      "instant or sorcery",
+      "target",
+      "lifelink",
+      "drain"
+    ],
+    "creature_types": ["Inkling"]
+  },
+  "RU": {
+    "name": "Prismari",
+    "themes": [
+      "magecraft",
+      "instant or sorcery",
+      "treasure",
+      "prowess",
+      "noncreature spell"
+    ],
+    "creature_types": ["Elemental"]
+  },
+  "RW": {
+    "name": "Lorehold",
+    "themes": [
+      "flashback",
+      "from your graveyard",
+      "exile",
+      "graveyard",
+      "magecraft"
+    ],
+    "creature_types": ["Spirit"]
+  },
+  "BG": {
+    "name": "Witherbloom",
+    "themes": [
+      "infusion",
+      "gained life",
+      "lifegain",
+      "sacrifice",
+      "drain",
+      "lose life"
+    ],
+    "creature_types": ["Pest"]
+  }
+}

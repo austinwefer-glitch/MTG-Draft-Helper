@@ -18,6 +18,11 @@ import json
 import re
 from pathlib import Path
 
+from phase7_synergy import (
+    load_archetype_config,
+    synergy_score,
+)
+
 
 # ---------- Tunable constants ----------
 
@@ -55,6 +60,16 @@ BASIC_LAND_PENALTY = -45.0
 
 # Curve bonus for filling an underrepresented CMC bucket.
 CURVE_BONUS = 1.5
+
+# Composition targets per archetype. Cards that fill an underrepresented
+# slot get a small bonus.
+ARCHETYPE_COMP_TARGETS = {
+    "aggressive": {"creatures": 17, "spells": 7},   # 24 nonlands + 16 lands
+    "midrange":   {"creatures": 15, "spells": 8},   # 23 + 17
+    "control":    {"creatures": 10, "spells": 12},  # 22 + 18
+}
+COMP_BONUS_LARGE = 1.5    # deficit >= 1.5 cards behind ideal
+COMP_BONUS_SMALL = 0.75   # deficit >= 0.5 cards behind ideal
 
 # "Wheel risk" adjustment: cards with low ALSA (Average Last Seen At) get
 # sniped if passed, so we boost them to encourage taking now. Cards with
@@ -216,6 +231,83 @@ def color_penalty(card_mana: str, my_colors: set, picks_made: int,
     return base_pen
 
 
+def detect_archetype(picked_cards: list) -> str:
+    """Classify a pool as aggressive / midrange / control based on its
+    CMC distribution and creature density.
+
+    Thresholds scale with pool size — early picks where almost no signal
+    exists default to midrange; clear signals at 10+ nonlands flip the
+    classification.
+    """
+    nonlands = [c for c in picked_cards
+                if "Land" not in (c.get("type_line") or "")]
+    if not nonlands:
+        return "midrange"
+
+    cmcs = []
+    creatures_at_low = 0
+    spells_at_high = 0
+    for c in nonlands:
+        try:
+            cmc = float(c.get("cmc") or 0)
+        except (TypeError, ValueError):
+            cmc = 0
+        cmcs.append(cmc)
+        is_cre = "Creature" in (c.get("type_line") or "")
+        if is_cre and cmc <= 2:
+            creatures_at_low += 1
+        if not is_cre and cmc >= 4:
+            spells_at_high += 1
+    avg = sum(cmcs) / len(cmcs)
+
+    # Scale threshold counts with pool size — 23 nonlands is a "full" deck
+    scale = max(0.3, len(nonlands) / 23)
+    if avg < 2.7 and creatures_at_low >= 7 * scale:
+        return "aggressive"
+    if avg > 3.6 and spells_at_high >= 4 * scale:
+        return "control"
+    return "midrange"
+
+
+def composition_bonus(card: dict, picked_cards: list) -> tuple[float, str]:
+    """Boost cards that move the pool toward a balanced creature/spell
+    mix for the detected archetype. Returns (bonus, archetype_label) so
+    callers can surface which archetype the targets came from.
+    """
+    if not picked_cards:
+        return 0, "midrange"
+    type_line = card.get("type_line") or ""
+    if "Land" in type_line:
+        return 0, "midrange"
+    nonlands = [c for c in picked_cards
+                if "Land" not in (c.get("type_line") or "")]
+    if not nonlands:
+        return 0, "midrange"
+
+    archetype = detect_archetype(nonlands)
+    targets = ARCHETYPE_COMP_TARGETS[archetype]
+    target_cre = targets["creatures"]
+    target_spell = targets["spells"]
+
+    cre_count = sum(1 for c in nonlands
+                    if "Creature" in (c.get("type_line") or ""))
+    spell_count = len(nonlands) - cre_count
+
+    target_total = target_cre + target_spell
+    progress = min(1.0, len(nonlands) / target_total)
+    ideal_cre = target_cre * progress
+    ideal_spell = target_spell * progress
+
+    is_card_creature = "Creature" in type_line
+    deficit = (ideal_cre - cre_count) if is_card_creature else (ideal_spell - spell_count)
+
+    if deficit >= 1.5:
+        return COMP_BONUS_LARGE, archetype
+    if deficit >= 0.5:
+        return COMP_BONUS_SMALL, archetype
+    return 0, archetype
+
+
 def wheel_adjustment(alsa) -> float:
     """Adjust score by how likely the card is to wheel back to you.
 
@@ -300,11 +392,19 @@ def score_card(card: dict, picked_cards: list, tier_data: dict,
                           len(picked_cards), gih)
     cbonus = curve_bonus(card.get("cmc"), picked_cards)
     wheel_adj = wheel_adjustment(alsa)
+    comp_bonus, comp_archetype = composition_bonus(card, picked_cards)
     basic_pen = BASIC_LAND_PENALTY if is_basic_land(card) else 0.0
     override_adj = ((overrides or {}).get(name, {}) or {}).get("score_adjust", 0)
     override_note = ((overrides or {}).get(name, {}) or {}).get("note", "")
 
-    final = base + cpen + cbonus + wheel_adj + basic_pen + override_adj
+    # Synergy: tribal + keyword + archetype theme match against the pool.
+    # archetype_config is loaded fresh each call for hot-reload.
+    syn_bonus, syn_reasons = synergy_score(
+        card, picked_cards, my_colors, load_archetype_config()
+    )
+
+    final = (base + cpen + cbonus + wheel_adj + comp_bonus + syn_bonus
+             + basic_pen + override_adj)
     return {
         "name": name,
         "score": round(final, 1),
@@ -312,6 +412,10 @@ def score_card(card: dict, picked_cards: list, tier_data: dict,
         "color_penalty": cpen,
         "curve_bonus": cbonus,
         "wheel_adjust": wheel_adj,
+        "composition_bonus": comp_bonus,
+        "composition_archetype": comp_archetype,
+        "synergy_bonus": syn_bonus,
+        "synergy_reasons": syn_reasons,
         "basic_penalty": basic_pen,
         "override_adjust": override_adj,
         "override_note": override_note,

@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox
 from pathlib import Path
 
 # Reuse all the loaders, parsers, and recommendation logic.
@@ -36,7 +37,9 @@ from phase4_recommender import (
     load_overrides,
     rank_pack,
     archetype_summary,
+    detect_archetype,
 )
+from phase6_deckbuilder import build_deck, cmc_of, is_creature
 
 
 LOG_PATH = (
@@ -198,6 +201,19 @@ class DraftHelperUI:
 
         status_frame = tk.Frame(header, bg=BG_PANEL)
         status_frame.pack(side=tk.RIGHT, padx=14)
+
+        # "Build Deck" button — opens deck-builder window using the current pool.
+        build_btn = tk.Button(
+            status_frame, text="Build Deck",
+            font=("Segoe UI Semibold", 9),
+            bg=BG_BASE, fg=ACCENT_GOLD,
+            activebackground=BG_DIVIDER, activeforeground=ACCENT_GOLD,
+            borderwidth=1, relief="flat", padx=10, pady=2,
+            cursor="hand2",
+            command=self._open_deck_builder,
+        )
+        build_btn.pack(side=tk.LEFT, padx=(0, 12))
+
         self.status_dot = tk.Label(
             status_frame, text="●",
             font=("Segoe UI", 11),
@@ -209,6 +225,10 @@ class DraftHelperUI:
             font=("Segoe UI", 9),
             bg=BG_PANEL, fg=FG_DIM,
         ).pack(side=tk.LEFT)
+
+        # State: keep the most recent picked-cards pool for deck building
+        self._current_pool: list[dict] = []
+        self._current_fmt: str = "QuickDraft"
 
         # --- Pack info ---
         self.pack_info_var = tk.StringVar(value="Waiting for a pack…")
@@ -501,6 +521,10 @@ class DraftHelperUI:
         ranked = rank_pack(pack_cards, picked_cards, self.tier_data,
                            fmt=fmt, overrides=self.overrides)
 
+        # Stash the pool for the deck builder
+        self._current_pool = list(picked_cards)
+        self._current_fmt = fmt
+
         # Header info
         pack_num = (payload.get("PackNumber", 0) or 0) + 1
         pick_num = (payload.get("PickNumber", 0) or 0) + 1
@@ -509,9 +533,14 @@ class DraftHelperUI:
             f"{ev}    ·    Pack {pack_num} / Pick {pick_num}    ·    "
             f"{len(pack_cards)} left in pack"
         )
+        # Detect what shape the pool is heading toward (aggressive / midrange / control).
+        # Once we have enough picks for the detection to be meaningful (10+),
+        # surface it so the user knows which targets the recommender is using.
+        shape = detect_archetype(picked_cards) if len(picked_cards) >= 10 else None
+        shape_str = f" · shape: {shape}" if shape else ""
         self.colors_var.set(
             f"Pool · {archetype_summary(picked_cards)} · "
-            f"{len(picked_cards)} picked"
+            f"{len(picked_cards)} picked{shape_str}"
         )
 
         # Top recommendation
@@ -556,11 +585,21 @@ class DraftHelperUI:
                 parts.append(f"curve +{top['curve_bonus']:g}")
             if top.get('wheel_adjust'):
                 parts.append(f"wheel {top['wheel_adjust']:+g}")
+            if top.get('composition_bonus'):
+                arch_short = (top.get('composition_archetype') or "")[:3]
+                parts.append(f"comp +{top['composition_bonus']:g} ({arch_short})")
+            if top.get('synergy_bonus'):
+                parts.append(f"synergy +{top['synergy_bonus']:g}")
             if top.get('basic_penalty'):
                 parts.append(f"basic-land {top['basic_penalty']:g}")
             if top.get('override_adjust'):
                 parts.append(f"override {top['override_adjust']:+g}")
-            self.rec_breakdown_var.set("  ·  ".join(parts))
+            breakdown_text = "  ·  ".join(parts)
+            # Append synergy reasons on a second line if any fired
+            reasons = top.get('synergy_reasons') or []
+            if reasons:
+                breakdown_text += "\n  synergy: " + " · ".join(reasons[:3])
+            self.rec_breakdown_var.set(breakdown_text)
 
         # Alternatives — clear and rebuild
         for child in self.alt_container.winfo_children():
@@ -580,12 +619,321 @@ class DraftHelperUI:
         if animate:
             self._pulse_top_panel()
 
+    # ---------- Deck builder window ----------
+
+    def _latest_pool_from_log(self) -> tuple[list, str]:
+        """Re-scan the log for the most recent draft state, return its
+        full picked-cards pool (regardless of whether there's an active
+        pack). Returns (pool, format_name)."""
+        try:
+            text = LOG_PATH.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return [], "QuickDraft"
+        payload = find_latest_bot_draft_status(text)
+        if not payload:
+            return [], "QuickDraft"
+        fmt = ("QuickDraft" if "QuickDraft" in (payload.get("EventName") or "")
+               else "PremierDraft")
+        pool = []
+        for sid in payload.get("PickedCards", []):
+            info = lookup_card(self.arena_index, self.scry, sid)
+            if info:
+                pool.append(info)
+        return pool, fmt
+
+    def _open_deck_builder(self):
+        """Launch a separate Toplevel window with the deck-build view.
+        Always re-reads the latest pool from the log so this works
+        whether a pack is currently visible or the draft has ended."""
+        pool, fmt = self._latest_pool_from_log()
+        if not pool:
+            messagebox.showinfo(
+                "Build Deck",
+                "Couldn't find a draft pool in the log.\n\n"
+                "Make sure you've completed at least a few picks with "
+                "Detailed Logs enabled, then try again."
+            )
+            return
+        # Reload overrides so the build uses the latest tweaks
+        self.overrides = load_overrides()
+        DeckBuilderWindow(
+            self.root, pool, self.tier_data, self.overrides, fmt,
+        )
+
     def _on_close(self):
         self._stop_event.set()
         self.root.destroy()
 
     def run(self):
         self.root.mainloop()
+
+
+class DeckBuilderWindow:
+    """Separate Toplevel window that shows a deck-build recommendation
+    based on the current pool. Independent of the main always-on-top
+    helper window."""
+
+    def __init__(self, parent, pool, tier_data, overrides, fmt):
+        self.win = tk.Toplevel(parent)
+        self.win.title("Deck Builder")
+        self.win.configure(bg=BG_BASE)
+        self.win.geometry("680x780+200+80")
+        self.win.minsize(560, 600)
+
+        self.pool = pool
+        self.tier_data = tier_data
+        self.overrides = overrides
+        self.fmt = fmt
+        self.build = None
+
+        self._build_layout()
+        self._render()
+
+    def _build_layout(self):
+        # Header bar
+        header = tk.Frame(self.win, bg=BG_PANEL, height=44)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(
+            header, text="Deck Builder",
+            font=("Segoe UI Semibold", 12),
+            bg=BG_PANEL, fg=FG_TEXT,
+        ).pack(side=tk.LEFT, padx=14)
+
+        rebuild_btn = tk.Button(
+            header, text="Rebuild",
+            font=("Segoe UI", 9),
+            bg=BG_BASE, fg=ACCENT_GOLD,
+            activebackground=BG_DIVIDER, activeforeground=ACCENT_GOLD,
+            borderwidth=1, relief="flat", padx=10, pady=2,
+            cursor="hand2",
+            command=self._render,
+        )
+        rebuild_btn.pack(side=tk.RIGHT, padx=14)
+
+        # Top summary
+        self.summary_var = tk.StringVar()
+        tk.Label(
+            self.win, textvariable=self.summary_var,
+            font=("Segoe UI Semibold", 11),
+            bg=BG_BASE, fg=ACCENT_GOLD, anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(10, 2))
+
+        self.detail_var = tk.StringVar()
+        tk.Label(
+            self.win, textvariable=self.detail_var,
+            font=("Segoe UI", 9),
+            bg=BG_BASE, fg=FG_DIM, anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(0, 10))
+
+        # Curve graph (textual ASCII bars)
+        curve_panel = tk.Frame(
+            self.win, bg=BG_PANEL,
+            highlightthickness=1, highlightbackground=BG_DIVIDER,
+        )
+        curve_panel.pack(fill=tk.X, padx=10, pady=(0, 10))
+        tk.Label(
+            curve_panel, text="MANA CURVE",
+            font=("Segoe UI Semibold", 8),
+            bg=BG_PANEL, fg=FG_DIM, anchor="w", padx=10,
+        ).pack(fill=tk.X, pady=(8, 2))
+        self.curve_text = tk.Text(
+            curve_panel, font=("Consolas", 9),
+            bg=BG_PANEL, fg=FG_TEXT, wrap=tk.NONE,
+            height=8, borderwidth=0, highlightthickness=0,
+            padx=12, pady=4,
+        )
+        self.curve_text.pack(fill=tk.X, pady=(0, 8))
+        self.curve_text.config(state=tk.DISABLED)
+
+        # Two-column body: deck on the left, cuts on the right
+        body = tk.Frame(self.win, bg=BG_BASE)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        # DECK column
+        deck_col = tk.Frame(body, bg=BG_BASE)
+        deck_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                      padx=(0, 5))
+        tk.Label(
+            deck_col, text="DECK (KEEP)",
+            font=("Segoe UI Semibold", 8),
+            bg=BG_BASE, fg=ACCENT_GREEN, anchor="w",
+        ).pack(fill=tk.X, padx=4, pady=(0, 4))
+        deck_frame = tk.Frame(
+            deck_col, bg=BG_PANEL,
+            highlightthickness=1, highlightbackground=BG_DIVIDER,
+        )
+        deck_frame.pack(fill=tk.BOTH, expand=True)
+        self.deck_text = tk.Text(
+            deck_frame, font=("Consolas", 9),
+            bg=BG_PANEL, fg=FG_TEXT, wrap=tk.NONE,
+            borderwidth=0, highlightthickness=0,
+            padx=10, pady=8, spacing1=1,
+        )
+        self.deck_text.pack(fill=tk.BOTH, expand=True)
+        self.deck_text.config(state=tk.DISABLED)
+
+        # CUTS column
+        cuts_col = tk.Frame(body, bg=BG_BASE)
+        cuts_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True,
+                      padx=(5, 0))
+        tk.Label(
+            cuts_col, text="CUTS",
+            font=("Segoe UI Semibold", 8),
+            bg=BG_BASE, fg=ACCENT_RED, anchor="w",
+        ).pack(fill=tk.X, padx=4, pady=(0, 4))
+        cuts_frame = tk.Frame(
+            cuts_col, bg=BG_PANEL,
+            highlightthickness=1, highlightbackground=BG_DIVIDER,
+        )
+        cuts_frame.pack(fill=tk.BOTH, expand=True)
+        self.cuts_text = tk.Text(
+            cuts_frame, font=("Consolas", 8),
+            bg=BG_PANEL, fg=FG_DIM, wrap=tk.NONE,
+            borderwidth=0, highlightthickness=0,
+            padx=10, pady=8, spacing1=1,
+        )
+        self.cuts_text.pack(fill=tk.BOTH, expand=True)
+        self.cuts_text.config(state=tk.DISABLED)
+
+    def _render(self):
+        self.build = build_deck(
+            self.pool, self.tier_data,
+            overrides=self.overrides, fmt=self.fmt,
+        )
+
+        # ---- Summary ----
+        b = self.build
+        cols = "".join(sorted(b["primary_colors"]))
+        splash = (f"  +  splash {''.join(sorted(b['splash_colors']))}"
+                  if b["splash_colors"] else "")
+        self.summary_var.set(
+            f"{b['archetype'].upper()}    ·    {cols}{splash}"
+        )
+        # Vs target — flag if we're short on creatures or spells
+        cre_n, cre_t = b["creature_count"], b["creature_target"]
+        nc_n, nc_t = b["noncreature_count"], b["noncreature_target"]
+        cre_warn = " ⚠" if cre_n < cre_t - 1 else ""
+        nc_warn = " ⚠" if nc_n < nc_t - 1 else ""
+        self.detail_var.set(
+            f"Pool: {len(self.pool)} cards   ·   "
+            f"Deck: {b['deck_total']} ({len(b['deck_nonlands'])}+"
+            f"{b['lands_total']} lands)   ·   "
+            f"{cre_n} creatures{cre_warn}  /  "
+            f"{nc_n} spells{nc_warn}"
+        )
+
+        # ---- Curve graph (split by creatures vs noncreatures) ----
+        cre_count = {b_: 0 for b_ in range(7)}
+        nc_count = {b_: 0 for b_ in range(7)}
+        for s in b["deck_scored"]:
+            c = cmc_of(s["card"])
+            if is_creature(s["card"]):
+                cre_count[c] += 1
+            else:
+                nc_count[c] += 1
+        max_count = max(
+            (cre_count[c] + nc_count[c] for c in range(7)),
+            default=1,
+        ) or 1
+        self.curve_text.config(state=tk.NORMAL)
+        self.curve_text.delete("1.0", tk.END)
+        # Clear old tags first
+        for tag in self.curve_text.tag_names():
+            if tag.startswith("curve_"):
+                self.curve_text.tag_delete(tag)
+        for c in sorted(cre_count):
+            label = f"{c}+" if c == 6 else str(c)
+            cre_n_b = cre_count[c]
+            nc_n_b = nc_count[c]
+            total = cre_n_b + nc_n_b
+            cre_bar = "█" * int(28 * cre_n_b / max_count) if cre_n_b else ""
+            nc_bar = "▒" * int(28 * nc_n_b / max_count) if nc_n_b else ""
+            self.curve_text.insert(
+                tk.END,
+                f"  CMC {label:<2}  {cre_n_b:>2}c {nc_n_b:>2}s  ",
+                "curve_label",
+            )
+            self.curve_text.insert(tk.END, cre_bar, f"curve_creature_{c}")
+            self.curve_text.insert(tk.END, nc_bar, f"curve_spell_{c}")
+            self.curve_text.insert(tk.END, "\n")
+        self.curve_text.tag_config("curve_label", foreground=FG_TEXT)
+        for c in range(7):
+            self.curve_text.tag_config(f"curve_creature_{c}",
+                                       foreground=ACCENT_GREEN)
+            self.curve_text.tag_config(f"curve_spell_{c}",
+                                       foreground=ACCENT_BLUE)
+        self.curve_text.config(state=tk.DISABLED)
+
+        # ---- Deck list ----
+        self.deck_text.config(state=tk.NORMAL)
+        self.deck_text.delete("1.0", tk.END)
+        for tag in self.deck_text.tag_names():
+            self.deck_text.tag_delete(tag)
+
+        # Header
+        self.deck_text.insert(tk.END, "Lands\n", "section")
+        basic_names = {"W": "Plains", "U": "Island", "B": "Swamp",
+                       "R": "Mountain", "G": "Forest"}
+        for c, n in sorted(b["lands"].items(), key=lambda x: -x[1]):
+            self.deck_text.insert(tk.END,
+                f"  {n:>2}x  {basic_names[c]}\n", "land"
+            )
+
+        # Group nonlands by CMC, sorted with creatures first inside each bucket
+        by_cmc: dict = {}
+        for s in b["deck_scored"]:
+            c = cmc_of(s["card"])
+            by_cmc.setdefault(c, []).append(s)
+        for c in sorted(by_cmc):
+            label = f"CMC {c}+" if c == 6 else f"CMC {c}"
+            self.deck_text.insert(tk.END, f"\n{label}\n", "section")
+            # Creatures first, then noncreatures, each by score
+            sorted_bucket = sorted(
+                by_cmc[c],
+                key=lambda x: (not is_creature(x["card"]), -x["base"]),
+            )
+            for s in sorted_bucket:
+                cost = s["card"].get("mana_cost") or ""
+                kind_marker = "•" if is_creature(s["card"]) else "◇"
+                tag = "creature" if is_creature(s["card"]) else "spell"
+                line = (f"  {kind_marker} {s['base']:>5.1f}  "
+                        f"{s['name'][:24]:<24} {cost}\n")
+                self.deck_text.insert(tk.END, line, tag)
+
+        self.deck_text.tag_config(
+            "section", foreground=ACCENT_GOLD,
+            font=("Segoe UI Semibold", 9), spacing1=4, spacing3=2,
+        )
+        self.deck_text.tag_config("land", foreground=FG_TEXT)
+        self.deck_text.tag_config("creature", foreground=ACCENT_GREEN)
+        self.deck_text.tag_config("spell", foreground=ACCENT_BLUE)
+        self.deck_text.config(state=tk.DISABLED)
+
+        # ---- Cuts ----
+        self.cuts_text.config(state=tk.NORMAL)
+        self.cuts_text.delete("1.0", tk.END)
+        for tag in self.cuts_text.tag_names():
+            self.cuts_text.tag_delete(tag)
+
+        # Group cuts by reason
+        cuts_by_reason: dict = {}
+        for c in b["cuts"]:
+            cuts_by_reason.setdefault(c["reason"], []).append(c)
+
+        for reason, items in cuts_by_reason.items():
+            self.cuts_text.insert(tk.END, f"{reason}\n", "section")
+            for c in sorted(items, key=lambda x: x["score"]):
+                name = c["card"].get("name", "?")[:26]
+                line = f"  {c['score']:>5.1f}  {name}\n"
+                self.cuts_text.insert(tk.END, line, "cut")
+
+        self.cuts_text.tag_config(
+            "section", foreground=ACCENT_RED,
+            font=("Segoe UI Semibold", 8), spacing1=6, spacing3=2,
+        )
+        self.cuts_text.tag_config("cut", foreground=FG_DIM)
+        self.cuts_text.config(state=tk.DISABLED)
 
 
 if __name__ == "__main__":

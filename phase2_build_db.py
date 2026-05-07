@@ -184,6 +184,12 @@ def build_database(cards: list[dict]) -> list[dict]:
                 # We use this to identify cards in the Arena log file.
                 "arena_id": card.get("arena_id"),
                 "mtgo_id": card.get("mtgo_id"),
+                # Synergy detection: keywords are Scryfall's parsed list of
+                # ability words (Flying, Magecraft, Adventure, etc.).
+                # oracle_text is the full rules text — we substring-search it
+                # for archetype themes.
+                "keywords": card.get("keywords", []),
+                "oracle_text": face.get("oracle_text", card.get("oracle_text", "")),
                 "image_path": str(image_path.relative_to(PROJECT_DIR)).replace("\\", "/"),
                 "phash": phash,
             }
