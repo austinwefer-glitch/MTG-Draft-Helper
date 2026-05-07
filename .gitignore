@@ -1,0 +1,30 @@
+# Generated card data — every user builds their own from Scryfall + MTGA
+card_db/cards.json
+card_db/arena_index.json
+card_db/tier_index.json
+card_db/images/
+
+# Personal overrides (don't ship someone else's tier preferences)
+card_db/overrides.json
+
+# Captured screenshots and debug crops (legacy OCR pipeline)
+screenshots/
+card_crops/
+ocr_debug/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,6 @@
+{
+  "_comment": "Edit these to target a different MTG Arena set. Set codes are lowercase Scryfall codes (e.g. 'sos' for Secrets of Strixhaven). After editing, re-run setup.py.",
+  "set_codes_in_pool": ["sos", "soa", "spg"],
+  "tier_set_code": "SOS",
+  "tier_formats": ["QuickDraft", "PremierDraft"]
+}
