@@ -7,6 +7,10 @@ card_db/images/
 # Personal overrides (don't ship someone else's tier preferences)
 card_db/overrides.json
 
+# Draft snapshots — your personal draft history
+card_db/last_draft.json
+card_db/drafts/
+
 # Captured screenshots and debug crops (legacy OCR pipeline)
 screenshots/
 card_crops/

@@ -26,6 +26,11 @@ from phase3_log_parse import (
     load_arena_index,
     load_scryfall_db_by_set_cn,
     find_latest_bot_draft_status,
+    find_latest_bot_draft_status_in_logs,
+    find_latest_payload_anywhere,
+    save_draft_snapshot,
+    list_archived_drafts,
+    payload_from_draft,
 )
 from phase3_tailer import (
     parse_pack_event,
@@ -201,6 +206,18 @@ class DraftHelperUI:
 
         status_frame = tk.Frame(header, bg=BG_PANEL)
         status_frame.pack(side=tk.RIGHT, padx=14)
+
+        # "Drafts" button — browse past drafts.
+        drafts_btn = tk.Button(
+            status_frame, text="Drafts",
+            font=("Segoe UI", 9),
+            bg=BG_BASE, fg=FG_TEXT,
+            activebackground=BG_DIVIDER, activeforeground=FG_TEXT,
+            borderwidth=1, relief="flat", padx=10, pady=2,
+            cursor="hand2",
+            command=self._open_drafts_history,
+        )
+        drafts_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         # "Build Deck" button — opens deck-builder window using the current pool.
         build_btn = tk.Button(
@@ -525,6 +542,10 @@ class DraftHelperUI:
         self._current_pool = list(picked_cards)
         self._current_fmt = fmt
 
+        # Persist the latest draft state so the deck builder can recover it
+        # later, even after Arena rotates its log files.
+        save_draft_snapshot(payload)
+
         # Header info
         pack_num = (payload.get("PackNumber", 0) or 0) + 1
         pick_num = (payload.get("PickNumber", 0) or 0) + 1
@@ -622,14 +643,10 @@ class DraftHelperUI:
     # ---------- Deck builder window ----------
 
     def _latest_pool_from_log(self) -> tuple[list, str]:
-        """Re-scan the log for the most recent draft state, return its
-        full picked-cards pool (regardless of whether there's an active
-        pack). Returns (pool, format_name)."""
-        try:
-            text = LOG_PATH.read_text(encoding="utf-8", errors="replace")
-        except FileNotFoundError:
-            return [], "QuickDraft"
-        payload = find_latest_bot_draft_status(text)
+        """Find the most recent pool from any source, falling back through:
+        live Player.log -> Player-prev.log -> last_draft.json -> drafts/ archive.
+        Always returns the freshest available even if Arena's been closed."""
+        payload = find_latest_payload_anywhere()
         if not payload:
             return [], "QuickDraft"
         fmt = ("QuickDraft" if "QuickDraft" in (payload.get("EventName") or "")
@@ -655,6 +672,38 @@ class DraftHelperUI:
             )
             return
         # Reload overrides so the build uses the latest tweaks
+        self.overrides = load_overrides()
+        DeckBuilderWindow(
+            self.root, pool, self.tier_data, self.overrides, fmt,
+        )
+
+    def _open_drafts_history(self):
+        """Open the past-drafts browser window."""
+        DraftHistoryWindow(
+            self.root,
+            arena_index=self.arena_index,
+            scry=self.scry,
+            tier_data=self.tier_data,
+            on_open_draft=self._open_deck_for_draft,
+        )
+
+    def _open_deck_for_draft(self, draft: dict):
+        """Build a deck from an arbitrary archived draft entry."""
+        payload = payload_from_draft(draft)
+        pool = []
+        for sid in payload.get("PickedCards", []):
+            info = lookup_card(self.arena_index, self.scry, sid)
+            if info:
+                pool.append(info)
+        if not pool:
+            messagebox.showinfo(
+                "Open Draft",
+                "Couldn't resolve any cards in this draft. The arena index "
+                "may have rotated since the draft was saved."
+            )
+            return
+        fmt = ("QuickDraft" if "QuickDraft" in (payload.get("EventName") or "")
+               else "PremierDraft")
         self.overrides = load_overrides()
         DeckBuilderWindow(
             self.root, pool, self.tier_data, self.overrides, fmt,
@@ -934,6 +983,196 @@ class DeckBuilderWindow:
         )
         self.cuts_text.tag_config("cut", foreground=FG_DIM)
         self.cuts_text.config(state=tk.DISABLED)
+
+
+class DraftHistoryWindow:
+    """A scrollable list of all persisted drafts. Click a row to open
+    the deck builder for that draft."""
+
+    def __init__(self, parent, arena_index, scry, tier_data, on_open_draft):
+        self.win = tk.Toplevel(parent)
+        self.win.title("Past Drafts")
+        self.win.configure(bg=BG_BASE)
+        self.win.geometry("620x520+150+100")
+        self.win.minsize(480, 320)
+
+        self.arena_index = arena_index
+        self.scry = scry
+        self.tier_data = tier_data
+        self.on_open_draft = on_open_draft
+
+        self._build_layout()
+        self._populate()
+
+    def _build_layout(self):
+        header = tk.Frame(self.win, bg=BG_PANEL, height=44)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(
+            header, text="Past Drafts",
+            font=("Segoe UI Semibold", 12),
+            bg=BG_PANEL, fg=FG_TEXT,
+        ).pack(side=tk.LEFT, padx=14)
+
+        refresh_btn = tk.Button(
+            header, text="Refresh",
+            font=("Segoe UI", 9),
+            bg=BG_BASE, fg=FG_TEXT,
+            activebackground=BG_DIVIDER, activeforeground=FG_TEXT,
+            borderwidth=1, relief="flat", padx=10, pady=2,
+            cursor="hand2",
+            command=self._populate,
+        )
+        refresh_btn.pack(side=tk.RIGHT, padx=14)
+
+        # Subtitle / count
+        self.count_var = tk.StringVar(value="")
+        tk.Label(
+            self.win, textvariable=self.count_var,
+            font=("Segoe UI", 9),
+            bg=BG_BASE, fg=FG_DIM, anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(8, 8))
+
+        # Scrollable list area
+        list_frame = tk.Frame(
+            self.win, bg=BG_PANEL,
+            highlightthickness=1, highlightbackground=BG_DIVIDER,
+        )
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        self.canvas = tk.Canvas(
+            list_frame, bg=BG_PANEL, highlightthickness=0,
+        )
+        scrollbar = tk.Scrollbar(
+            list_frame, orient=tk.VERTICAL, command=self.canvas.yview,
+        )
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.rows_frame = tk.Frame(self.canvas, bg=BG_PANEL)
+        self.canvas.create_window(
+            (0, 0), window=self.rows_frame, anchor="nw"
+        )
+        self.rows_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        )
+        # Mouse-wheel scroll
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _on_mousewheel(self, event):
+        # Only scroll if our window has focus
+        try:
+            if self.win.focus_displayof() and self.win == self.win.focus_displayof().winfo_toplevel():
+                self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _format_when(self, saved_at: str) -> str:
+        """Pretty-format the saved_at timestamp."""
+        if not saved_at:
+            return "(unknown)"
+        # ISO format like "2026-05-07T14:32:11"
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(saved_at)
+            return dt.strftime("%Y-%m-%d  %H:%M")
+        except (ValueError, TypeError):
+            return saved_at
+
+    def _build_row(self, parent, draft: dict, idx: int) -> tk.Frame:
+        is_current = draft.get("is_current", False)
+        row_bg = BG_TOP_PICK if is_current else (
+            BG_PANEL if idx % 2 == 0 else BG_ROW_ALT
+        )
+        row = tk.Frame(parent, bg=row_bg, cursor="hand2")
+        row.pack(fill=tk.X)
+
+        inner = tk.Frame(row, bg=row_bg)
+        inner.pack(fill=tk.X, padx=12, pady=8)
+
+        when = self._format_when(draft.get("saved_at", ""))
+        event = draft.get("event_name", "?")
+        n = draft.get("card_count", 0)
+        tag = "  • current" if is_current else ""
+
+        # When + tag
+        when_lbl = tk.Label(
+            inner, text=when + tag,
+            font=("Consolas", 9),
+            bg=row_bg, fg=ACCENT_GOLD if is_current else FG_DIM,
+            anchor="w",
+        )
+        when_lbl.pack(side=tk.LEFT, padx=(0, 16))
+
+        # Event name + cards
+        event_lbl = tk.Label(
+            inner, text=f"{event}",
+            font=("Segoe UI", 9),
+            bg=row_bg, fg=FG_TEXT, anchor="w",
+        )
+        event_lbl.pack(side=tk.LEFT, padx=(0, 16))
+
+        cards_lbl = tk.Label(
+            inner, text=f"{n} cards",
+            font=("Segoe UI", 9),
+            bg=row_bg, fg=FG_DIM, anchor="w",
+        )
+        cards_lbl.pack(side=tk.LEFT)
+
+        open_lbl = tk.Label(
+            inner, text="Open  ➜",
+            font=("Segoe UI", 9),
+            bg=row_bg, fg=ACCENT_GOLD,
+        )
+        open_lbl.pack(side=tk.RIGHT)
+
+        # Click anywhere on the row opens the deck builder
+        def _on_click(e, d=draft):
+            self.on_open_draft(d)
+        for w in (row, inner, when_lbl, event_lbl, cards_lbl, open_lbl):
+            w.bind("<Button-1>", _on_click)
+
+        # Hover effect
+        def _enter(e, w=row, ws=[row, inner, when_lbl, event_lbl, cards_lbl, open_lbl]):
+            for x in ws:
+                x.config(bg=BG_DIVIDER)
+        def _leave(e, w=row, ws=[row, inner, when_lbl, event_lbl, cards_lbl, open_lbl], orig=row_bg):
+            for x in ws:
+                x.config(bg=orig)
+        for w in (row, inner, when_lbl, event_lbl, cards_lbl, open_lbl):
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+
+        return row
+
+    def _populate(self):
+        # Clear existing rows
+        for child in self.rows_frame.winfo_children():
+            child.destroy()
+
+        drafts = list_archived_drafts()
+        if not drafts:
+            self.count_var.set("No drafts saved yet.")
+            tk.Label(
+                self.rows_frame,
+                text=("Drafts will appear here automatically once you've "
+                      "drafted with the helper running."),
+                font=("Segoe UI", 9),
+                bg=BG_PANEL, fg=FG_DIM,
+                wraplength=520, justify="left",
+                padx=20, pady=20,
+            ).pack(fill=tk.X)
+            return
+
+        n = len(drafts)
+        self.count_var.set(
+            f"{n} draft{'s' if n != 1 else ''} saved · "
+            f"click any row to view its deck recommendation"
+        )
+        for idx, draft in enumerate(drafts):
+            self._build_row(self.rows_frame, draft, idx)
 
 
 if __name__ == "__main__":

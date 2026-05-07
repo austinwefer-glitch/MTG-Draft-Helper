@@ -13,9 +13,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from phase3_log_parse import (
-    find_latest_bot_draft_status,
+    find_latest_payload_anywhere,
     load_arena_index,
     load_scryfall_db_by_set_cn,
+    LOG_PATH,
 )
 from phase3_tailer import lookup_card
 from phase4_recommender import load_tier_index, load_overrides
@@ -29,15 +30,11 @@ LOG_PATH = (
 
 
 def main() -> None:
-    if not LOG_PATH.exists():
-        print(f"Log file not found: {LOG_PATH}")
-        sys.exit(1)
-
-    text = LOG_PATH.read_text(encoding="utf-8", errors="replace")
-    payload = find_latest_bot_draft_status(text)
+    payload = find_latest_payload_anywhere()
     if not payload:
-        print("No draft state found in the log.")
-        print("Make sure you've drafted at least once with Detailed Logs on.")
+        print("No draft state found anywhere (live logs, snapshot, or archive).")
+        print("Make sure you've drafted at least once with the helper running")
+        print("and Detailed Logs enabled in Arena.")
         sys.exit(1)
 
     print("Loading arena index...", end=" ", flush=True)
