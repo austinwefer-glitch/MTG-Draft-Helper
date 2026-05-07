@@ -35,7 +35,7 @@ else:
     SET_CODE = "SOS"
     FORMATS = ["QuickDraft", "PremierDraft"]
 
-USER_AGENT = "MTGDraftHelper/0.1 (https://github.com/your-username/mtg-draft-helper)"
+USER_AGENT = "MTGDraftHelper/0.1 (https://github.com/austinwefer-glitch/MTG-Draft-Helper)"
 OUTPUT = Path("card_db") / "tier_index.json"
 
 

@@ -40,7 +40,7 @@ else:
     SET_CODES = ["sos", "soa", "spg"]
 
 SCRYFALL_API = "https://api.scryfall.com"
-USER_AGENT = "MTGDraftHelper/0.1 (https://github.com/your-username/mtg-draft-helper)"
+USER_AGENT = "MTGDraftHelper/0.1 (https://github.com/austinwefer-glitch/MTG-Draft-Helper)"
 
 # Scryfall asks for at least 50-100ms between requests. We use 100ms.
 REQUEST_DELAY_SEC = 0.1
