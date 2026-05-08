@@ -53,10 +53,23 @@ LANDS_BY_ARCHETYPE = {
     "control":    18,
 }
 
-# A card is a "bomb" worth splashing if its WR clears this threshold AND
-# it has a single off-color pip (so it's actually castable).
-SPLASH_WR_THRESHOLD = 0.60
-MAX_SPLASH_CARDS = 2
+# Splashing rules: when (and how aggressively) to recommend a splash.
+# A splash is justified by either:
+#   - One true bomb with adjusted WR >= SPLASH_BOMB_THRESHOLD, or
+#   - Multiple cards in the same off-color, each >= SPLASH_MULTI_THRESHOLD.
+# WRs are SAMPLE-SIZE-SHRUNKEN — small-sample noise won't trigger splashes.
+# All splash cards must share a single splash color (never 4-color decks).
+SPLASH_BOMB_THRESHOLD = 0.68     # was 0.65 — "good card" no longer justifies solo splash
+SPLASH_MULTI_THRESHOLD = 0.58
+SPLASH_MIN_CARDS_MULTI = 2       # need this many cards to use the lower threshold
+MAX_SPLASH_CARDS = 2             # max splash cards retained in the deck
+SPLASH_KEEP_NONBOMB_THRESHOLD = 0.60  # second card kept alongside a bomb
+
+# Splash candidates must be at least this CMC. Splashing 1-2 drops is
+# impractical because you need to draw the splash land by turn 2, and a
+# 2-source splash gives ~5-15% odds. 4+ CMC cards have multiple turns to
+# find the off-color land.
+SPLASH_MIN_CMC = 3
 
 # How much to "flatten" the mana base toward an even split between primary
 # colors. 0 = strictly proportional to pip count (extreme splits possible).
@@ -70,9 +83,11 @@ MAX_SPLASH_CARDS = 2
 #   1.0  -> 9 / 8    (always balanced regardless of pip count)
 MANA_BASE_FLATTEN = 0.7
 
-# Splash colors get a flat number of lands rather than proportional
-# (you don't want 1 splash land for a splashed bomb you must cast).
-SPLASH_LANDS_PER_COLOR = 2
+# Splash colors get lands scaled by how many splash cards we're running.
+# 1 splash card -> 2 lands; 2 splash cards -> 3 lands. Helps consistency
+# when you've committed multiple slots to the splash.
+SPLASH_LANDS_BASE = 2
+SPLASH_LANDS_EXTRA_PER_CARD = 1   # each additional splash card adds this many lands
 
 
 def cmc_of(card: dict) -> int:
@@ -86,8 +101,28 @@ def is_land(card: dict) -> bool:
     return "Land" in (card.get("type_line") or "")
 
 
+def is_basic_land_card(card: dict) -> bool:
+    """True for true basic lands (Plains/Island/Swamp/Mountain/Forest/Wastes).
+
+    Basic lands are added by the mana-base computation, never as deck slots.
+    Nonbasic lands (duals, fixing lands, utility lands) ARE deck slots.
+    """
+    return "basic land" in (card.get("type_line") or "").lower()
+
+
 def is_creature(card: dict) -> bool:
     return "Creature" in (card.get("type_line") or "")
+
+
+def land_fits_deck(card: dict, deck_colors: set) -> bool:
+    """A nonbasic land is playable if its color identity is a subset of
+    the deck's colors (or it's colorless — utility lands are always fine)."""
+    if not is_land(card) or is_basic_land_card(card):
+        return False
+    ci = set(card.get("color_identity") or [])
+    if not ci:
+        return True
+    return ci.issubset(deck_colors)
 
 
 def detect_archetype(nonland_cards: list[dict]) -> str:
@@ -113,8 +148,14 @@ def detect_archetype(nonland_cards: list[dict]) -> str:
 
 
 def find_splash_candidates(pool, primary_colors, tier_data, overrides, fmt):
-    """Off-color cards strong enough to splash. Sorted best-first, capped."""
-    out = []
+    """Off-color cards worth splashing — restricted to a SINGLE splash color.
+
+    Builds candidates per off-color, then evaluates whether each off-color
+    has a strong enough case (one true bomb OR multiple decent cards). Picks
+    the single best off-color and returns up to MAX_SPLASH_CARDS from it.
+    Never splashes two off-colors at once.
+    """
+    by_color: dict = {}
     for card in pool:
         if is_land(card):
             continue
@@ -124,19 +165,53 @@ def find_splash_candidates(pool, primary_colors, tier_data, overrides, fmt):
         off = cs - primary_colors
         if len(off) != 1:
             continue
-        # Count pips: for splash we want exactly 1 strict off-color pip max
         pips = parse_color_symbols(card.get("mana_cost", ""))
         off_pip_count = sum(n for c, n in pips.items() if c not in primary_colors)
         if off_pip_count > 1.5:
             continue
-        s = score_card(card, [], tier_data, fmt=fmt, overrides=overrides)
-        wr = s.get("gih_wr")
-        if wr is None or wr < SPLASH_WR_THRESHOLD:
+        # Reject low-CMC splash candidates — too hard to consistently cast.
+        if cmc_of(card) < SPLASH_MIN_CMC:
             continue
-        out.append({"card": card, "scored": s,
-                    "splash_color": next(iter(off))})
-    out.sort(key=lambda x: -(x["scored"]["gih_wr"] or 0))
-    return out[:MAX_SPLASH_CARDS]
+        s = score_card(card, [], tier_data, fmt=fmt, overrides=overrides)
+        # Use the sample-size-shrunken WR so noisy cards with thin
+        # 17Lands data can't trigger splashes off a single high-variance run.
+        wr = s.get("adjusted_wr")
+        if wr is None:
+            wr = s.get("gih_wr")
+        if wr is None:
+            continue
+        splash_color = next(iter(off))
+        by_color.setdefault(splash_color, []).append({
+            "card": card, "scored": s, "splash_color": splash_color, "wr": wr,
+        })
+
+    if not by_color:
+        return []
+
+    # Per-color: is the splash case justified?
+    valid: dict = {}
+    for color, candidates in by_color.items():
+        candidates.sort(key=lambda x: -x["wr"])
+        top = candidates[0]
+        if top["wr"] >= SPLASH_BOMB_THRESHOLD:
+            # Solo bomb justifies splash. Bring along any other strong cards.
+            valid[color] = [c for c in candidates
+                            if c["wr"] >= SPLASH_KEEP_NONBOMB_THRESHOLD
+                           ][:MAX_SPLASH_CARDS]
+        else:
+            multi = [c for c in candidates if c["wr"] >= SPLASH_MULTI_THRESHOLD]
+            if len(multi) >= SPLASH_MIN_CARDS_MULTI:
+                valid[color] = multi[:MAX_SPLASH_CARDS]
+
+    if not valid:
+        return []
+
+    # Pick the single best splash color: top card's WR, tiebreak by depth
+    best_color = max(
+        valid,
+        key=lambda c: (max(card["wr"] for card in valid[c]), len(valid[c])),
+    )
+    return valid[best_color]
 
 
 def build_deck(pool: list[dict], tier_data: dict,
@@ -165,14 +240,24 @@ def build_deck(pool: list[dict], tier_data: dict,
         s = score_card(card, [], tier_data, fmt=fmt, overrides=overrides)
         scored_all.append(s)
 
-    # Split into playable / cuts based on color fit
+    # Split into playable / cuts based on color fit.
+    # Lands are split: BASIC lands -> cuts (mana base picks them).
+    #                  Nonbasic lands fitting deck colors -> nonbasic_lands_in_deck.
+    #                  Off-color nonbasic lands -> cuts.
     playable: list[dict] = []
+    nonbasic_lands_in_deck: list[dict] = []
     cuts: list[dict] = []
     for s in scored_all:
         card = s["card"]
         if is_land(card):
-            cuts.append({"card": card, "scored": s, "score": s["base"],
-                         "reason": "Land — handled in mana base"})
+            if is_basic_land_card(card):
+                cuts.append({"card": card, "scored": s, "score": s["base"],
+                             "reason": "Basic land — handled in mana base"})
+            elif land_fits_deck(card, deck_colors):
+                nonbasic_lands_in_deck.append(s)
+            else:
+                cuts.append({"card": card, "scored": s, "score": s["base"],
+                             "reason": "Off-color land"})
             continue
         cs = card_colors(card.get("mana_cost", ""))
         if cs and not cs.issubset(deck_colors):
@@ -260,9 +345,21 @@ def build_deck(pool: list[dict], tier_data: dict,
                 s["card"].get("mana_cost", "")).items():
             pip_count[c] += n
 
-    # Reserve splash lands first
-    splash_total = SPLASH_LANDS_PER_COLOR * len(splash_colors)
-    primary_lands_budget = max(0, lands_total - splash_total)
+    # Reserve splash lands first — scaled by number of splash cards.
+    # 1 splash card -> SPLASH_LANDS_BASE lands; each additional splash
+    # card adds SPLASH_LANDS_EXTRA_PER_CARD more.
+    n_splash_cards = len([sc for sc in (splash_candidates or [])])
+    splash_lands_for_color = (
+        SPLASH_LANDS_BASE
+        + max(0, n_splash_cards - 1) * SPLASH_LANDS_EXTRA_PER_CARD
+        if n_splash_cards > 0 else 0
+    )
+    splash_total = splash_lands_for_color * len(splash_colors)
+
+    # Nonbasic lands we're keeping in the deck (Forum of Amity, etc.) eat
+    # land slots too — subtract them from the basic-land budget.
+    n_nonbasic = len(nonbasic_lands_in_deck)
+    primary_lands_budget = max(0, lands_total - splash_total - n_nonbasic)
     primary_with_pips = [c for c in primary if pip_count[c] > 0]
     if not primary_with_pips:
         # Edge case: no primary-color cards, just use whatever has pips
@@ -278,11 +375,12 @@ def build_deck(pool: list[dict], tier_data: dict,
         flat = prop_share * (1 - MANA_BASE_FLATTEN) + even_share * MANA_BASE_FLATTEN
         lands[c] = max(1, round(flat))
     for c in splash_colors:
-        lands[c] = SPLASH_LANDS_PER_COLOR
+        lands[c] = splash_lands_for_color
 
-    # Trim to hit lands_total exactly
-    while sum(lands.values()) > lands_total:
-        # Take from the primary color we have most of
+    # Trim to hit lands_total - n_nonbasic exactly (basics-only count;
+    # nonbasic lands fill the remaining slots).
+    basic_target = max(0, lands_total - n_nonbasic)
+    while sum(lands.values()) > basic_target:
         primaries_in_lands = {c: lands[c] for c in lands if c in primary}
         if primaries_in_lands:
             target = max(primaries_in_lands, key=lambda c: primaries_in_lands[c])
@@ -291,8 +389,7 @@ def build_deck(pool: list[dict], tier_data: dict,
         lands[target] -= 1
         if lands[target] <= 0:
             del lands[target]
-    while sum(lands.values()) < lands_total:
-        # Add to color with most pips (skewed toward primaries)
+    while sum(lands.values()) < basic_target:
         if primary_with_pips:
             target = max(primary_with_pips, key=lambda c: pip_count[c])
         else:
@@ -308,6 +405,7 @@ def build_deck(pool: list[dict], tier_data: dict,
         "splash_cards": [sc["card"] for sc in splash_candidates],
         "deck_nonlands": [s["card"] for s in deck],
         "deck_scored": deck,
+        "deck_nonbasic_lands": nonbasic_lands_in_deck,
         "lands": lands,
         "lands_total": lands_total,
         "cuts": cuts,

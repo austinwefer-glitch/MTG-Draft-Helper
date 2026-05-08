@@ -928,6 +928,13 @@ class DeckBuilderWindow:
             self.deck_text.insert(tk.END,
                 f"  {n:>2}x  {basic_names[c]}\n", "land"
             )
+        # Nonbasic lands (duals, fixing) included in the deck
+        for s in (b.get("deck_nonbasic_lands") or []):
+            name = (s.get("card") or s).get("name", "?") if isinstance(s, dict) else "?"
+            # s here is the score dict with a "card" subkey
+            card = s.get("card") if isinstance(s, dict) and "card" in s else s
+            n = (card or {}).get("name", "?")
+            self.deck_text.insert(tk.END, f"   1x  {n}\n", "land")
 
         # Group nonlands by CMC, sorted with creatures first inside each bucket
         by_cmc: dict = {}

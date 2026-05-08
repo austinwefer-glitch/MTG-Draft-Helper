@@ -61,6 +61,12 @@ BASIC_LAND_PENALTY = -45.0
 # Curve bonus for filling an underrepresented CMC bucket.
 CURVE_BONUS = 1.5
 
+# Blend top-player and all-player win rates from 17Lands. 0 = use only
+# all-player data, 1 = use only top-player data. The actual top weight is
+# scaled by sample size — small top samples fall back toward all-player.
+BLEND_TOP_WEIGHT = 0.65
+BLEND_TOP_MIN_SAMPLES = 100   # top data fully trusted at this many games
+
 # Composition targets per archetype. Cards that fill an underrepresented
 # slot get a small bonus.
 ARCHETYPE_COMP_TARGETS = {
@@ -169,6 +175,35 @@ def shrunken_wr(gih_wr, sample_size,
 
 
 # ---------- Scoring layers ----------
+
+def blended_gih_wr(fmt_data: dict) -> tuple:
+    """Combine top-player and all-player win rates with sample-size weighting.
+
+    Returns (blended_wr, total_sample_size). When the top-player sample is
+    small (fewer than BLEND_TOP_MIN_SAMPLES games), the blend leans more
+    on all-player data so we don't trust noisy top stats.
+
+    Backward-compatible with old tier_index files that only store
+    'gih_wr' / 'drawn_count' (treated as the all-player value).
+    """
+    top_wr = fmt_data.get("gih_wr_top")
+    top_n = fmt_data.get("drawn_count_top") or 0
+    all_wr = fmt_data.get("gih_wr_all")
+    all_n = fmt_data.get("drawn_count_all") or 0
+    if all_wr is None:
+        all_wr = fmt_data.get("gih_wr")
+        all_n = fmt_data.get("drawn_count") or 0
+
+    if top_wr is None and all_wr is None:
+        return None, 0
+    if top_wr is None:
+        return all_wr, all_n
+    if all_wr is None:
+        return top_wr, top_n
+    confidence = min(1.0, top_n / BLEND_TOP_MIN_SAMPLES)
+    w = BLEND_TOP_WEIGHT * confidence
+    return top_wr * w + all_wr * (1 - w), all_n + top_n
+
 
 def base_grade(adjusted_wr) -> float:
     """Convert (shrunken) GIH WR to a 0..100 grade.
@@ -371,16 +406,32 @@ def score_card(card: dict, picked_cards: list, tier_data: dict,
     fallback_fmt = "PremierDraft" if fmt == "QuickDraft" else "QuickDraft"
     front = name.split(" // ")[0] if " // " in name else None
 
+    def _has_wr(d):
+        return bool(d and (d.get("gih_wr_all") or d.get("gih_wr_top")
+                            or d.get("gih_wr")))
+
     fmt_data = _lookup(name, fmt)
-    if not fmt_data.get("gih_wr") and front:
+    if not _has_wr(fmt_data) and front:
         fmt_data = _lookup(front, fmt)
-    if not fmt_data.get("gih_wr"):
+    if not _has_wr(fmt_data):
         fmt_data = _lookup(name, fallback_fmt) or fmt_data
-    if not fmt_data.get("gih_wr") and front:
+    if not _has_wr(fmt_data) and front:
         fmt_data = _lookup(front, fallback_fmt) or fmt_data
 
-    gih = fmt_data.get("gih_wr")
-    sample = fmt_data.get("drawn_count")
+    # 17Lands has very limited top-player data for QuickDraft (top players
+    # mostly play Premier). When the current-format slot has no top data,
+    # borrow it from PremierDraft so Quick drafters still benefit from
+    # expert opinion.
+    if not fmt_data.get("gih_wr_top"):
+        pd_data = _lookup(name, "PremierDraft")
+        if not pd_data.get("gih_wr_top") and front:
+            pd_data = _lookup(front, "PremierDraft")
+        if pd_data.get("gih_wr_top") is not None:
+            fmt_data = dict(fmt_data)
+            fmt_data["gih_wr_top"] = pd_data.get("gih_wr_top")
+            fmt_data["drawn_count_top"] = pd_data.get("drawn_count_top", 0)
+
+    gih, sample = blended_gih_wr(fmt_data)
     alsa = fmt_data.get("alsa")
     ata = fmt_data.get("ata")
 

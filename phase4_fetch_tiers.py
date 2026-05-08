@@ -39,19 +39,33 @@ USER_AGENT = "MTGDraftHelper/0.1 (https://github.com/austinwefer-glitch/MTG-Draf
 OUTPUT = Path("card_db") / "tier_index.json"
 
 
-def fetch_format(set_code: str, fmt: str) -> list[dict]:
-    """Fetch all card ratings for one (set, format) pair."""
-    params = {"expansion": set_code, "format": fmt}
-    url = "https://www.17lands.com/card_ratings/data?" + urllib.parse.urlencode(params)
+USER_GROUPS = ["all", "top"]
+
+
+def fetch_format(set_code: str, fmt: str, user_group: str) -> list[dict]:
+    """Fetch all card ratings for one (set, format, user_group) tuple.
+
+    17Lands treats "all users" as the unfiltered default — passing
+    user_group=all returns empty data. Only the "top" filter is a real
+    parameter value.
+    """
+    params = {
+        "expansion": set_code,
+        "format": fmt,
+    }
+    if user_group != "all":
+        params["user_group"] = user_group
+    url = ("https://www.17lands.com/card_ratings/data?"
+           + urllib.parse.urlencode(params))
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
     })
-    print(f"Fetching {fmt}...  ({url})")
+    print(f"Fetching {fmt} ({user_group})...")
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read().decode("utf-8"))
     if not isinstance(data, list):
-        raise RuntimeError(f"Unexpected response type for {fmt}: {type(data)}")
+        raise RuntimeError(f"Unexpected response type for {fmt}/{user_group}")
     print(f"  -> {len(data)} card ratings")
     return data
 
@@ -59,27 +73,33 @@ def fetch_format(set_code: str, fmt: str) -> list[dict]:
 def main() -> None:
     by_name: dict[str, dict] = {}
     for fmt in FORMATS:
-        try:
-            data = fetch_format(SET_CODE, fmt)
-        except Exception as e:
-            print(f"  Failed to fetch {fmt}: {e}")
-            continue
-        for entry in data:
-            name = entry.get("name")
-            if not name:
+        for ug in USER_GROUPS:
+            try:
+                data = fetch_format(SET_CODE, fmt, ug)
+            except Exception as e:
+                print(f"  Failed to fetch {fmt} ({ug}): {e}")
                 continue
-            slot = by_name.setdefault(name, {})
-            slot[fmt] = {
-                "alsa": entry.get("avg_seen"),
-                "ata": entry.get("avg_pick"),
-                "gih_wr": entry.get("ever_drawn_win_rate"),
-                "ohwr": entry.get("opening_hand_win_rate"),
-                "iwd": entry.get("drawn_improvement_win_rate"),
-                "drawn_count": entry.get("drawn_game_count"),
-                "color": entry.get("color"),
-                "rarity": entry.get("rarity"),
-            }
-        time.sleep(0.5)  # be polite to 17Lands' servers
+            for entry in data:
+                name = entry.get("name")
+                if not name:
+                    continue
+                slot = by_name.setdefault(name, {}).setdefault(fmt, {})
+                # ALSA / ATA / color / rarity only stored from the 'all' group
+                # (those are about community pick order — broader sample is better).
+                if ug == "all":
+                    slot["alsa"] = entry.get("avg_seen")
+                    slot["ata"] = entry.get("avg_pick")
+                    slot["color"] = entry.get("color")
+                    slot["rarity"] = entry.get("rarity")
+                    slot["gih_wr_all"] = entry.get("ever_drawn_win_rate")
+                    slot["drawn_count_all"] = entry.get("drawn_game_count")
+                    # Legacy fields kept for backward compatibility
+                    slot["gih_wr"] = entry.get("ever_drawn_win_rate")
+                    slot["drawn_count"] = entry.get("drawn_game_count")
+                else:  # "top"
+                    slot["gih_wr_top"] = entry.get("ever_drawn_win_rate")
+                    slot["drawn_count_top"] = entry.get("drawn_game_count")
+            time.sleep(0.5)  # be polite to 17Lands' servers
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT.open("w", encoding="utf-8") as f:
@@ -88,22 +108,23 @@ def main() -> None:
     print()
     print(f"Wrote {len(by_name)} cards to {OUTPUT}")
 
-    # Quick sanity check
-    print("\nSample entries:")
+    # Quick sanity check showing both player groups side by side
+    print("\nSample entries (all-player WR / top-player WR):")
     for sample_name in [
         "Emeritus of Ideation",
         "Sleight of Hand",
-        "Plains",
         "Wild Hypothesis",
     ]:
         e = by_name.get(sample_name)
-        if e:
-            qd = e.get("QuickDraft", {})
-            gih = qd.get("gih_wr")
-            print(f"  {sample_name:32}  QuickDraft GIH WR = "
-                  f"{gih*100:.1f}%" if gih else "  (no data)")
-        else:
+        if not e:
             print(f"  {sample_name:32}  NOT FOUND")
+            continue
+        qd = e.get("QuickDraft", {})
+        all_wr = qd.get("gih_wr_all")
+        top_wr = qd.get("gih_wr_top")
+        all_str = f"{all_wr*100:.1f}%" if all_wr is not None else "  -  "
+        top_str = f"{top_wr*100:.1f}%" if top_wr is not None else "  -  "
+        print(f"  {sample_name:32}  all={all_str:>7}   top={top_str:>7}")
 
 
 if __name__ == "__main__":
