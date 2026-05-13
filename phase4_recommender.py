@@ -82,9 +82,9 @@ COMP_BONUS_SMALL = 0.75   # deficit >= 0.5 cards behind ideal
 # high ALSA tend to come back to you, so a small deprioritization saves
 # the pick for stronger contested cards.
 # These thresholds work across pack/pick numbers; tweak if needed.
-WHEEL_BONUS_VERY_CONTESTED = 2.0   # ALSA <= 2.0
-WHEEL_BONUS_CONTESTED = 1.5        # ALSA <= 3.5
-WHEEL_BONUS_MEDIUM = 0.75          # ALSA <= 5.0
+WHEEL_BONUS_VERY_CONTESTED = 4.0   # ALSA <= 2.0  (community first-pick consensus)
+WHEEL_BONUS_CONTESTED = 2.5        # ALSA <= 3.5
+WHEEL_BONUS_MEDIUM = 1.5           # ALSA <= 5.0
 WHEEL_PENALTY_LIKELY_WHEEL = -0.75 # ALSA >= 9.0
 WHEEL_PENALTY_USUALLY_WHEELS = -1.5  # ALSA >= 11.0
 
